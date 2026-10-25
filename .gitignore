@@ -12,3 +12,11 @@ findings.json
 manifest.yaml
 .env
 .claude/
+
+# Internal docs & future phase planning (Preserved locally, not pushed)
+HOW_IT_WORKS.md
+USER_WORKFLOWS_GUIDE.md
+*phase*.md
+*PHASE*.md
+docs/internal/
+*.local.md

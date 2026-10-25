@@ -1,48 +1,119 @@
-"""Minimal Groq (OpenAI-compatible) chat client, shared by samples and later phases."""
+"""Universal multi-provider chat client using LiteLLM."""
 
 from __future__ import annotations
 
 import os
 from typing import Any, Optional
 
-import httpx
+import litellm
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from agentguard._env import load_env
+from agentguard.config import get_config, normalize_model
+from agentguard.logging import get_logger
 
 load_env()
+logger = get_logger("llm")
 
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-# llama-3.3-70b-versatile has been retired from Groq's catalog; gpt-oss-20b
-# is the current default — fast, cheap, and supports tool calling.
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+# Suppress noisy LiteLLM startup/debugging logs
+litellm.suppress_debug_info = True
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Check if exception is a transient HTTP/network or rate limit error."""
+    err_str = str(exc).lower()
+    # Never retry on permanent daily quota exhaustion
+    if any(q in err_str for q in ("quota exceeded", "resource_exhausted", "daily limit")):
+        return False
+    if any(k in err_str for k in ("rate_limit", "ratelimit", "429", "timeout", "timed out", "connection error", "503", "502")):
+        return True
+    return False
+
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1.5, min=2, max=30),
+    retry=retry_if_exception(_is_retryable_error),
+    reraise=True,
+)
+def _completion_with_retry(model: str, messages: list[dict], **kwargs: Any) -> Any:
+    logger.debug("Executing LiteLLM completion (model: %s)", model)
+    return litellm.completion(model=model, messages=messages, **kwargs)
 
 
 def chat(
     messages: list[dict],
     tools: Optional[list[dict]] = None,
-    model: str = DEFAULT_MODEL,
+    model: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 1024,
+    api_key: Optional[str] = None,
+    api_base: Optional[str] = None,
+    timeout: float = 45.0,
 ) -> dict[str, Any]:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY not set (checked .env and environment)")
+    raw_model = model or get_config().chat_model
+    target_model = normalize_model(raw_model)
+    config = get_config()
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
+    call_kwargs: dict[str, Any] = {
         "temperature": temperature,
         "max_tokens": max_tokens,
+        "timeout": timeout,
     }
     if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
+        call_kwargs["tools"] = tools
+        call_kwargs["tool_choice"] = "auto"
+    if api_key:
+        call_kwargs["api_key"] = api_key
+    if api_base or config.api_base:
+        call_kwargs["api_base"] = api_base or config.api_base
 
-    resp = httpx.post(
-        GROQ_URL,
-        json=payload,
-        headers={"Authorization": f"Bearer {api_key}"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    try:
+        resp = _completion_with_retry(model=target_model, messages=messages, **call_kwargs)
+
+        choice = resp.choices[0]
+        msg = choice.message
+
+        # Format tool calls into standard dictionary representation
+        raw_tools = getattr(msg, "tool_calls", None)
+        formatted_tool_calls = []
+        if raw_tools:
+            for tc in raw_tools:
+                if isinstance(tc, dict):
+                    formatted_tool_calls.append(tc)
+                elif hasattr(tc, "function"):
+                    fn_obj = tc.function
+                    fn_dict = {
+                        "name": getattr(fn_obj, "name", None) if not isinstance(fn_obj, dict) else fn_obj.get("name"),
+                        "arguments": getattr(fn_obj, "arguments", None) if not isinstance(fn_obj, dict) else fn_obj.get("arguments"),
+                    }
+                    formatted_tool_calls.append({
+                        "id": getattr(tc, "id", None),
+                        "type": getattr(tc, "type", "function"),
+                        "function": fn_dict,
+                    })
+                elif hasattr(tc, "model_dump") and callable(tc.model_dump):
+                    formatted_tool_calls.append(tc.model_dump())
+
+        content = getattr(msg, "content", "") or ""
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": getattr(msg, "role", "assistant"),
+                        "content": content,
+                        "tool_calls": formatted_tool_calls,
+                    }
+                }
+            ],
+            "model": getattr(resp, "model", target_model),
+            "usage": getattr(resp, "usage", {}),
+        }
+    except Exception as exc:
+        logger.error("Multi-provider chat completion failed for model '%s': %s", target_model, exc)
+        raise

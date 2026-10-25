@@ -10,16 +10,31 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 
+from agentguard.logging import get_logger
+
+logger = get_logger("manifest")
+
 DESTRUCTIVE_HINTS = (
     "transfer", "send", "pay", "delete", "remove", "drop", "write",
     "update", "execute", "exec", "run_command", "shell", "purchase",
     "buy", "withdraw", "post", "publish", "email", "notify",
+)
+
+DATA_EXFILTRATION_HINTS = (
+    "send", "mail", "post", "notify", "webhook", "publish", "export",
+    "transfer", "write", "upload", "transmit", "dump",
+)
+
+PRIVILEGE_HINTS = (
+    "admin", "role", "manage", "permission", "grant", "sudo", "auth",
+    "override", "config", "debug", "root", "supervisor",
 )
 
 
@@ -48,13 +63,16 @@ class Manifest:
                 "multi_agent": self.multi_agent,
             }
         }
-        Path(path).write_text(yaml.safe_dump(data, sort_keys=False))
+        Path(path).write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        logger.info("Saved manifest to %s", path)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Manifest":
-        data = yaml.safe_load(Path(path).read_text()) or {}
+        content = Path(path).read_text(encoding="utf-8")
+        data = yaml.safe_load(content) or {}
         cap = data.get("capabilities", {})
         tools = [ToolInfo(**t) for t in cap.get("tools", [])]
+        logger.debug("Loaded manifest from %s with %d tools", path, len(tools))
         return cls(
             tools=tools,
             rag=cap.get("rag", {"present": False, "ingestion": None}),
@@ -67,6 +85,10 @@ class Manifest:
         categories = ["prompt_injection", "secret_extraction"]
         if any(t.destructive for t in self.tools):
             categories.append("tool_misuse")
+        if any(any(h in t.name.lower() for h in DATA_EXFILTRATION_HINTS) for t in self.tools):
+            categories.append("data_exfiltration")
+        if self.multi_agent or any(any(h in t.name.lower() for h in PRIVILEGE_HINTS) for t in self.tools):
+            categories.append("privilege_escalation")
         if self.rag.get("present"):
             categories.append("rag_poisoning")
         if self.memory.get("present"):
@@ -87,6 +109,7 @@ TOOL_DECORATOR_HINTS = ("tool", "watch")
 
 def scan_project(path: str | Path) -> dict[str, Any]:
     """Walk .py files under `path`, return structural candidates via AST."""
+    logger.debug("Scanning Python files under %s", path)
     candidates: dict[str, Any] = {
         "tools": [],
         "rag_signals": [],
@@ -96,13 +119,14 @@ def scan_project(path: str | Path) -> dict[str, Any]:
 
     for py_file in sorted(Path(path).rglob("*.py")):
         try:
-            src = py_file.read_text()
+            src = py_file.read_text(encoding="utf-8")
             tree = ast.parse(src)
-        except (SyntaxError, UnicodeDecodeError):
+        except (SyntaxError, UnicodeDecodeError, OSError) as exc:
+            logger.debug("Skipping file %s during AST scan: %s", py_file, exc)
             continue
 
         for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 decs = [ast.unparse(d) for d in node.decorator_list]
                 if any(any(h in d.lower() for h in TOOL_DECORATOR_HINTS) for d in decs):
                     candidates["tools"].append({
@@ -130,6 +154,12 @@ def scan_project(path: str | Path) -> dict[str, Any]:
                     if any(h in low or h in mod for h in MEMORY_IMPORT_HINTS):
                         candidates["memory_signals"].append(alias.name)
 
+    logger.debug(
+        "Scan candidates found: %d tools, %d RAG signals, %d memory signals",
+        len(candidates["tools"]),
+        len(candidates["rag_signals"]),
+        len(candidates["memory_signals"]),
+    )
     return candidates
 
 
@@ -140,6 +170,7 @@ def _heuristic_destructive(name: str, doc: Optional[str]) -> bool:
 
 def heuristic_manifest(path: str | Path) -> Manifest:
     """AST-only synthesis, no LLM/Chroma involved. Deterministic fallback."""
+    logger.debug("Generating heuristic manifest for %s", path)
     candidates = scan_project(path)
     tools = [
         ToolInfo(
@@ -160,10 +191,7 @@ def heuristic_manifest(path: str | Path) -> Manifest:
 
 
 # ---------------------------------------------------------------------------
-# Chroma indexing. Uses a small dependency-free hashing embedder rather than
-# chromadb's default ONNX model — that model is a ~80MB on-demand download
-# and proved slow/flaky in this environment. Good enough for keyword-level
-# retrieval of "context around a candidate", which is all synthesis needs.
+# Chroma indexing.
 # ---------------------------------------------------------------------------
 
 _HASH_DIM = 256
@@ -214,30 +242,74 @@ def build_index(path: str | Path, collection_name: str = "agentguard-manifest"):
     docs, ids, metas = [], [], []
     for py_file in sorted(Path(path).rglob("*.py")):
         try:
-            src = py_file.read_text()
-        except UnicodeDecodeError:
+            src = py_file.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
             continue
-        # chunk by top-level def/class blocks; fall back to whole file
-        chunks = src.split("\ndef ") if "\ndef " in src else [src]
-        for i, chunk in enumerate(chunks):
-            if not chunk.strip():
+        # chunk by top-level def/async def/class blocks; fall back to whole file
+        if "\ndef " in src or "\nclass " in src or "\nasync def " in src:
+            raw_chunks = re.split(r"\n(?=(?:def |async def |class ))", src)
+        else:
+            raw_chunks = [src]
+
+        for i, chunk in enumerate(raw_chunks):
+            stripped = chunk.strip()
+            if not stripped:
                 continue
-            docs.append(chunk[:2000])
+            docs.append(stripped[:2500])
             ids.append(f"{py_file}::{i}")
-            metas.append({"file": str(py_file)})
+            metas.append({"file": str(py_file), "chunk_id": i})
 
     if docs:
         collection.add(documents=docs, ids=ids, metadatas=metas)
+    logger.debug("Indexed %d source chunks in Chroma for %s", len(docs), path)
     return collection
 
 
 def retrieve_context(collection, query: str, n_results: int = 3) -> str:
+    """Retrieve top matches for a single query formatted as markdown."""
     if collection.count() == 0:
         return ""
     n = min(n_results, collection.count())
     results = collection.query(query_texts=[query], n_results=n)
     docs = results.get("documents", [[]])[0]
     return "\n---\n".join(docs)
+
+
+def retrieve_chunks(collection, queries: list[str], n_results: int = 3) -> list[dict]:
+    """Query Chroma with multiple search queries and return deduplicated chunks."""
+    if collection.count() == 0 or not queries:
+        return []
+    seen_ids: set[str] = set()
+    collected_chunks: list[dict] = []
+
+    clean_queries = [q for q in queries if q and q.strip()]
+    if not clean_queries:
+        return []
+
+    try:
+        n = min(n_results, collection.count())
+        res = collection.query(query_texts=clean_queries, n_results=n)
+        all_docs = res.get("documents", [])
+        all_ids = res.get("ids", [])
+        all_metas = res.get("metadatas", [])
+
+        for q_idx in range(len(clean_queries)):
+            docs = all_docs[q_idx] if q_idx < len(all_docs) else []
+            doc_ids = all_ids[q_idx] if q_idx < len(all_ids) else []
+            metas = all_metas[q_idx] if q_idx < len(all_metas) else []
+
+            for doc, doc_id, meta in zip(docs, doc_ids, metas):
+                if doc_id not in seen_ids:
+                    seen_ids.add(doc_id)
+                    collected_chunks.append({
+                        "id": doc_id,
+                        "file": meta.get("file", "unknown"),
+                        "text": doc,
+                    })
+    except Exception as exc:
+        logger.warning("Chroma chunk retrieval failed: %s", exc)
+
+    return collected_chunks
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +338,7 @@ def synthesize(path: str | Path, use_llm: bool = True) -> Manifest:
     Falls back to heuristic_manifest() if use_llm is False or any LLM call
     fails, so a flaky/rate-limited provider never blocks manifest generation.
     """
+    logger.info("Synthesizing manifest for %s (use_llm=%s)", path, use_llm)
     candidates = scan_project(path)
 
     if not use_llm:
@@ -273,7 +346,8 @@ def synthesize(path: str | Path, use_llm: bool = True) -> Manifest:
 
     try:
         collection = build_index(path)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to build Chroma index (%s), falling back to heuristic", exc)
         return heuristic_manifest(path)
 
     from agentguard.llm import chat
@@ -295,21 +369,27 @@ def synthesize(path: str | Path, use_llm: bool = True) -> Manifest:
                 temperature=0.0,
             )
             verdict = resp["choices"][0]["message"]["content"].strip().upper()
+            logger.debug("LLM verdict for tool '%s': %s", t["name"], verdict)
             if "DESTRUCTIVE" in verdict:
                 destructive = True
             elif "SAFE" in verdict:
                 destructive = False
-        except Exception:
-            pass  # keep heuristic verdict — a flaky LLM call shouldn't block synthesis
+        except Exception as exc:
+            logger.warning(
+                "LLM synthesis check failed for tool '%s' (%s), using heuristic verdict (%s)",
+                t["name"], exc, destructive
+            )
 
         tools.append(ToolInfo(
             name=t["name"], args=t["args"], destructive=destructive,
             doc=t["doc"], file=t["file"],
         ))
 
-    return Manifest(
+    manifest = Manifest(
         tools=tools,
         rag={"present": bool(candidates["rag_signals"]), "ingestion": None},
         memory={"present": bool(candidates["memory_signals"])},
         multi_agent=candidates["agent_call_count"] > 1,
     )
+    logger.info("Synthesized manifest: %d tools, routing=%s", len(tools), manifest.routing())
+    return manifest

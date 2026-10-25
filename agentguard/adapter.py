@@ -26,6 +26,9 @@ from typing import Any, Callable, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+from agentguard.logging import get_logger
+
+logger = get_logger("adapter")
 app = FastAPI(title="agentguard-adapter")
 
 _entrypoint: Optional[Callable[..., Any]] = None
@@ -54,6 +57,7 @@ def expose(fn: Callable[..., Any]) -> Callable[..., Any]:
     """Mark `fn` as the target's entrypoint, served at POST /invoke."""
     global _entrypoint
     _entrypoint = fn
+    logger.info("Registered @expose entrypoint: %s", fn.__name__)
     return fn
 
 
@@ -64,7 +68,9 @@ def watch(fn: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         log = _calls.get()
         if log is not None:
-            log.append({"name": fn.__name__, "args": _bind(fn, args, kwargs), "ts": time.time()})
+            bound_args = _bind(fn, args, kwargs)
+            log.append({"name": fn.__name__, "args": bound_args, "ts": time.time()})
+            logger.debug("Recorded @watch call: %s(%s)", fn.__name__, bound_args)
         return fn(*args, **kwargs)
 
     return wrapper
@@ -78,6 +84,7 @@ def health() -> dict:
 @app.post("/invoke")
 def invoke(req: InvokeRequest) -> dict:
     if _entrypoint is None:
+        logger.warning("POST /invoke rejected: no @expose entrypoint registered")
         return {
             "output": None,
             "tool_calls": [],
@@ -97,15 +104,18 @@ def invoke(req: InvokeRequest) -> dict:
             output = _entrypoint(req.input_text)
     except Exception as e:  # noqa: BLE001 - deliberately broad; capture as data
         error = {"type": type(e).__name__, "detail": str(e)}
+        logger.warning("Target entrypoint exception: %s: %s", type(e).__name__, e)
     finally:
         calls = _calls.get() or []
         _calls.reset(token)
 
+    latency_ms = (time.perf_counter() - t0) * 1000
+    logger.debug("POST /invoke completed in %.2f ms (tools recorded: %d)", latency_ms, len(calls))
     return {
         "output": output,
         "tool_calls": calls,
         "error": error,
-        "latency_ms": (time.perf_counter() - t0) * 1000,
+        "latency_ms": latency_ms,
     }
 
 
@@ -113,4 +123,5 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the adapter's FastAPI app. Binds to localhost only."""
     import uvicorn
 
+    logger.info("Serving agentguard-adapter on http://%s:%d", host, port)
     uvicorn.run(app, host=host, port=port)

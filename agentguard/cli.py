@@ -1,17 +1,31 @@
 import json
 from pathlib import Path
+from typing import Optional
 
 import click
 
 from agentguard.attackers import run_attack_suite_sync
+from agentguard.config import AgentGuardConfig, get_config, set_config
+from agentguard.logging import get_logger, setup_logging
 from agentguard.manifest import Manifest, synthesize
 from agentguard.reporters import compute_scorecard, generate_report
 from agentguard.target import Target
 
+logger = get_logger("cli")
+
 
 @click.group()
-def main() -> None:
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose debug logging.")
+@click.option("-q", "--quiet", is_flag=True, help="Enable quiet mode (errors only).")
+@click.option("--config", "config_file", type=click.Path(exists=True, dir_okay=False), help="Path to custom agentguard.yaml configuration file.")
+@click.pass_context
+def main(ctx: click.Context, verbose: bool, quiet: bool, config_file: Optional[str]) -> None:
     """AgentGuard — automated red-teaming for AI agent applications."""
+    ctx.ensure_object(dict)
+    setup_logging(verbose=verbose, quiet=quiet)
+    cfg = AgentGuardConfig.load(config_path=config_file)
+    set_config(cfg)
+    ctx.obj["config"] = cfg
 
 
 @main.command()
@@ -45,10 +59,13 @@ def init(project_path: str, manifest_out: str | None, no_llm: bool) -> None:
 @click.option("--findings-out", default="findings.json", help="Where to write findings.json.")
 @click.option("--report-out", default="report.md", help="Where to write report.md.")
 @click.option("--canary", "canaries", multiple=True, help="Known canary string(s) to check for in target responses. Repeatable.")
-@click.option("--max-probes", default=6, help="Max probes per attacker category.")
+@click.option("--max-probes", default=None, type=int, help="Max probes per attacker category (default: from config).")
+@click.option("--attacker-model", default=None, help="Override LLM model used by attacker agents.")
+@click.option("--reporter-model", default=None, help="Override LLM model used by reporter agents.")
 def test(project_path: str, target_url: str, manifest_path: str | None,
          findings_out: str, report_out: str, canaries: tuple[str, ...],
-         max_probes: int) -> None:
+         max_probes: Optional[int], attacker_model: Optional[str],
+         reporter_model: Optional[str]) -> None:
     """Run the full pipeline against a live target: manifest -> attack -> report.
 
     The target must already be running and reachable at --target-url (start
@@ -69,24 +86,44 @@ def test(project_path: str, target_url: str, manifest_path: str | None,
     click.echo(f"Routing to attacker categories: {manifest.routing()}")
 
     target = Target(target_url)
-    health = target.health()
+    try:
+        health = target.health()
+    except Exception as exc:
+        raise click.ClickException(f"Could not connect to target at {target_url}: {exc}")
+
     if not health.get("entrypoint_registered"):
         raise click.ClickException(
             f"Target at {target_url} has no @expose entrypoint registered — check it's the right process."
         )
 
+    probes = max_probes if max_probes is not None else get_config().max_probes
+
     click.echo(f"Attacking {target_url} ...")
-    sink = run_attack_suite_sync(target, manifest, findings_out, canaries=list(canaries), max_probes=max_probes)
+    sink = run_attack_suite_sync(
+        target,
+        manifest,
+        findings_out,
+        canaries=list(canaries),
+        max_probes=probes,
+        model=attacker_model,
+    )
     click.echo(f"Wrote {findings_out}")
 
-    scorecard = compute_scorecard(json.loads(Path(findings_out).read_text()))
+    findings_data = json.loads(Path(findings_out).read_text(encoding="utf-8"))
+    scorecard = compute_scorecard(findings_data)
     click.echo(f"Scorecard: {scorecard['total_successes']}/{scorecard['total_attempts']} "
                f"attacks succeeded ({scorecard['success_rate']:.0%})")
     for cat, row in scorecard["by_category"].items():
         click.echo(f"  {cat}: {row['succeeded']}/{row['attempted']}")
 
     click.echo("Generating report (offline, no further contact with the target)...")
-    generate_report(findings_out, report_out, manifest_path=str(manifest_file))
+    generate_report(
+        findings_out,
+        report_out,
+        manifest_path=str(manifest_file),
+        model=reporter_model,
+        project_path=project_path,
+    )
     click.echo(f"Wrote {report_out}")
 
 

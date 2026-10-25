@@ -8,14 +8,16 @@ no import of agentguard.target and must stay that way.
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from agentguard._env import load_env
+from agentguard.config import get_config, normalize_model
+from agentguard.logging import get_logger
 
 load_env()
+logger = get_logger("reporters")
 
 from crewai import Agent, Crew, Process, Task, LLM  # noqa: E402
 
@@ -29,15 +31,15 @@ import crewai.llms.cache as _crewai_cache_mod  # noqa: E402
 # property 'cache_breakpoint' is unsupported"), the same class of bug as
 # ADK's reasoning_content issue in attackers.py. No-op the function that
 # adds the flag rather than patch every call site that strips it.
-_crewai_cache_mod.mark_cache_breakpoint = lambda message: message
-
-# Same override mechanism as attackers.py — separate Groq daily quota bucket
-# per model, useful when one is exhausted (hit during Phase 4 validation).
-REPORTER_MODEL = os.environ.get("AGENTGUARD_REPORTER_MODEL", "groq/openai/gpt-oss-20b")
+try:
+    _crewai_cache_mod.mark_cache_breakpoint = lambda message: message
+except Exception as exc:
+    logger.warning("Could not apply mark_cache_breakpoint patch: %s", exc)
 
 
 def load_findings(path: str | Path) -> dict[str, Any]:
-    return json.loads(Path(path).read_text())
+    content = Path(path).read_text(encoding="utf-8")
+    return json.loads(content)
 
 
 def compute_scorecard(findings: dict[str, Any]) -> dict[str, Any]:
@@ -60,14 +62,11 @@ def compute_scorecard(findings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _source_snippets(manifest: Manifest | None, max_chars: int = 1200) -> str:
-    """Real source for each manifest-declared tool, so the remediation
-    engineer names actual code instead of inventing a plausible-looking
-    signature (observed during Phase 5 validation: a fix cited
-    'transfer_funds(amount, destination_account)' when the real signature
-    is 'transfer_funds(to, amount)', because it had no source to check)."""
+def _source_snippets(manifest: Manifest | None, max_chars: Optional[int] = None) -> str:
+    """Real source for each manifest-declared tool as fallback."""
     if manifest is None:
         return "(no manifest provided — no source available, do not invent file contents)"
+    char_limit = max_chars if max_chars is not None else get_config().source_snippet_max_chars
     seen_files: set[str] = set()
     chunks = []
     for tool in manifest.tools:
@@ -75,16 +74,83 @@ def _source_snippets(manifest: Manifest | None, max_chars: int = 1200) -> str:
             continue
         seen_files.add(tool.file)
         try:
-            src = Path(tool.file).read_text()[:max_chars]
-        except OSError:
+            src = Path(tool.file).read_text(encoding="utf-8")[:char_limit]
+        except OSError as exc:
+            logger.debug("Could not read tool file %s: %s", tool.file, exc)
             continue
         chunks.append(f"### {tool.file}\n```python\n{src}\n```")
     return "\n\n".join(chunks) if chunks else "(no source files found for declared tools)"
 
 
+def get_remediation_source_context(
+    findings: list[dict],
+    manifest: Manifest | None = None,
+    project_path: Optional[str | Path] = None,
+) -> str:
+    """Retrieve semantically relevant code context for the remediation engineer.
+
+    Uses ChromaDB vector search around the confirmed finding capabilities and tool names.
+    Falls back gracefully to file snippets if Chroma is unavailable.
+    """
+    if manifest is None and not project_path:
+        return "(no manifest or source provided)"
+
+    # Determine project directory to index
+    target_dir: Optional[Path] = None
+    if project_path:
+        target_dir = Path(project_path)
+    elif manifest and manifest.tools:
+        for t in manifest.tools:
+            if t.file and Path(t.file).exists():
+                target_dir = Path(t.file).resolve().parent
+                break
+
+    if target_dir and target_dir.exists():
+        try:
+            from agentguard.manifest import build_index, retrieve_chunks
+
+            # Collect search queries from confirmed findings and manifest
+            search_terms: list[str] = []
+            for f in findings:
+                if f.get("capability_targeted"):
+                    search_terms.append(f["capability_targeted"])
+                if f.get("category"):
+                    search_terms.append(f["category"].replace("_", " "))
+                for turn in f.get("turns", []):
+                    for tc in turn.get("tool_calls", []):
+                        if tc.get("name"):
+                            search_terms.append(tc["name"])
+
+            if manifest:
+                for t in manifest.tools:
+                    search_terms.append(t.name)
+
+            clean_terms = list(dict.fromkeys(t for t in search_terms if t))
+            logger.debug("Querying Chroma vector index for remediation terms: %s", clean_terms)
+
+            collection = build_index(target_dir, collection_name="agentguard-remediation")
+            chunks = retrieve_chunks(collection, clean_terms, n_results=2)
+
+            if chunks:
+                formatted = [
+                    f"### Context from {c['file']}\n```python\n{c['text']}\n```"
+                    for c in chunks
+                ]
+                logger.info("Retrieved %d relevant vector chunks for remediation engineer", len(formatted))
+                return "\n\n".join(formatted)
+        except Exception as exc:
+            logger.warning("Chroma remediation retrieval failed (%s), falling back to static snippets", exc)
+
+    return _source_snippets(manifest)
+
+
 def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
-                manifest: Manifest | None = None) -> Crew:
-    llm = LLM(model=REPORTER_MODEL)
+                manifest: Manifest | None = None,
+                model: Optional[str] = None,
+                project_path: Optional[str | Path] = None) -> Crew:
+    chosen_model = normalize_model(model or get_config().reporter_model)
+    logger.debug("Building CrewAI reporter crew using model: %s", chosen_model)
+    llm = LLM(model=chosen_model)
 
     analyst = Agent(
         role="Security severity analyst",
@@ -124,9 +190,11 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
         verbose=False,
     )
 
-    successful = [a for a in findings["attempts"] if a.get("success")]
-    failed = [a for a in findings["attempts"] if not a.get("success")]
+    successful = [a for a in findings.get("attempts", []) if a.get("success")]
+    failed = [a for a in findings.get("attempts", []) if not a.get("success")]
     manifest_summary = findings.get("manifest_summary", {})
+
+    remediation_context = get_remediation_source_context(successful, manifest, project_path=project_path)
 
     rate_task = Task(
         description=(
@@ -147,10 +215,10 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
         description=(
             "Using the same findings and the severities from the previous "
             "task, write a concrete remediation for each finding id. Below "
-            "is the ACTUAL source code for the target's declared tools — "
+            "is the ACTUAL source code context retrieved from the target project — "
             "quote real function/parameter names from it, do not invent a "
             "plausible-looking signature:\n\n"
-            f"{_source_snippets(manifest)}\n\n"
+            f"{remediation_context}\n\n"
             "Never write generic advice like 'improve validation' — if you "
             "can't name something specific because it's not in the source "
             "above, say 'requires manual review of <area>' instead of "
@@ -194,28 +262,41 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
 
 
 def generate_report(findings_path: str | Path, report_path: str | Path,
-                     manifest_path: str | Path | None = None) -> str:
+                     manifest_path: str | Path | None = None,
+                     model: Optional[str] = None,
+                     project_path: Optional[str | Path] = None) -> str:
     """Findings JSON (+ optional manifest for real source) in, report.md out.
     No network access to any target."""
+    logger.info("Generating report from %s -> %s", findings_path, report_path)
     findings = load_findings(findings_path)
     scorecard = compute_scorecard(findings)
     manifest = Manifest.from_yaml(manifest_path) if manifest_path else None
-    crew = build_crew(findings, scorecard, manifest)
-    # CrewAI's generic LLM class has no built-in retry-on-429 (unlike ADK's
-    # LiteLlm, which takes num_retries directly) — hit live against Groq's
-    # per-minute cap during Phase 5 validation. Manual backoff here.
+    
+    # Infer project path if not explicitly provided
+    resolved_proj_path = project_path
+    if not resolved_proj_path and manifest_path:
+        resolved_proj_path = Path(manifest_path).resolve().parent
+
+    crew = build_crew(findings, scorecard, manifest, model=model, project_path=resolved_proj_path)
+
     last_error: Exception | None = None
     for attempt in range(4):
         try:
+            logger.info("Running CrewAI reporting tasks (attempt %d/4)...", attempt + 1)
             result = crew.kickoff()
             break
         except Exception as e:  # noqa: BLE001
             last_error = e
             if "rate_limit" not in str(e).lower() and "RateLimitError" not in type(e).__name__:
+                logger.error("CrewAI kickoff failed with non-rate-limit error: %s", e)
                 raise
-            time.sleep(25 * (attempt + 1))
+            sleep_duration = 25 * (attempt + 1)
+            logger.warning("CrewAI hit rate limit, waiting %ds before retry (%s)", sleep_duration, e)
+            time.sleep(sleep_duration)
     else:
         raise last_error  # type: ignore[misc]
-    report_md = str(result)
-    Path(report_path).write_text(report_md)
+
+    report_md = getattr(result, "raw", None) or str(result)
+    Path(report_path).write_text(report_md, encoding="utf-8")
+    logger.info("Successfully wrote report to %s", report_path)
     return report_md
