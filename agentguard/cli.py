@@ -106,8 +106,12 @@ def test(project_path: str, target_url: str, manifest_path: str | None,
         canaries=list(canaries),
         max_probes=probes,
         model=attacker_model,
+        budget=None,
     )
     click.echo(f"Wrote {findings_out}")
+
+    if getattr(sink, "_budget", None) is not None:
+        logger.info("Budget usage: %s", sink._budget.usage_report())
 
     findings_data = json.loads(Path(findings_out).read_text(encoding="utf-8"))
     scorecard = compute_scorecard(findings_data)

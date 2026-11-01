@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from agentguard.budget import BudgetTracker
 
 import litellm
 from tenacity import (
@@ -55,6 +58,8 @@ def chat(
     api_key: Optional[str] = None,
     api_base: Optional[str] = None,
     timeout: float = 45.0,
+    budget: Optional["BudgetTracker"] = None,
+    role: str = "unspecified",
 ) -> dict[str, Any]:
     raw_model = model or get_config().chat_model
     target_model = normalize_model(raw_model)
@@ -101,6 +106,17 @@ def chat(
                     formatted_tool_calls.append(tc.model_dump())
 
         content = getattr(msg, "content", "") or ""
+
+        if budget is not None:
+            usage_obj = getattr(resp, "usage", None)
+            if isinstance(usage_obj, dict):
+                prompt_tokens = usage_obj.get("prompt_tokens", 0)
+                completion_tokens = usage_obj.get("completion_tokens", 0)
+            else:
+                prompt_tokens = getattr(usage_obj, "prompt_tokens", 0) if usage_obj else 0
+                completion_tokens = getattr(usage_obj, "completion_tokens", 0) if usage_obj else 0
+            budget.record(role=role, prompt_tokens=prompt_tokens or 0, completion_tokens=completion_tokens or 0)
+
         return {
             "choices": [
                 {

@@ -100,6 +100,26 @@ def test_findings_sink_lifecycle(tmp_path: Path):
     assert saved["attempts"][0]["category"] == "prompt_injection"
 
 
+def test_findings_sink_scorecard_compatibility():
+    from agentguard.reporters import compute_scorecard
+    from agentguard.schemas import AttemptStatus, Finding
+
+    sink = FindingsSink(
+        target_desc={"url": "http://127.0.0.1:8000"},
+        manifest_summary={"tools": []},
+    )
+    sink.attempts.append(
+        Finding(
+            category="prompt_injection",
+            capability_targeted="system_prompt",
+            status=AttemptStatus.CONFIRMED,
+        )
+    )
+    scorecard = compute_scorecard({"attempts": sink.attempts})
+    assert scorecard["total_successes"] == 1
+    assert scorecard["total_attempts"] == 1
+
+
 def test_assistant_message_no_reasoning():
     msg = _assistant_message_no_reasoning(
         content="Hello",
