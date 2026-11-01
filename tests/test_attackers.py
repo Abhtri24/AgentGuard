@@ -100,7 +100,7 @@ def test_findings_sink_lifecycle(tmp_path: Path):
     assert saved["attempts"][0]["category"] == "prompt_injection"
 
 
-def test_findings_sink_scorecard_compatibility():
+def test_findings_sink_scorecard_compatibility(tmp_path: Path):
     from agentguard.reporters import compute_scorecard
     from agentguard.schemas import AttemptStatus, Finding
 
@@ -118,6 +118,14 @@ def test_findings_sink_scorecard_compatibility():
     scorecard = compute_scorecard({"attempts": sink.attempts})
     assert scorecard["total_successes"] == 1
     assert scorecard["total_attempts"] == 1
+
+    # Real path: serialize to JSON and load back
+    out_file = tmp_path / "findings.json"
+    sink.to_json(out_file)
+    findings_data = json.loads(out_file.read_text(encoding="utf-8"))
+    json_scorecard = compute_scorecard(findings_data)
+    assert json_scorecard["total_successes"] == 1
+    assert json_scorecard["total_attempts"] == 1
 
 
 def test_assistant_message_no_reasoning():

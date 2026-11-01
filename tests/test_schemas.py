@@ -63,6 +63,7 @@ def test_finding_json_roundtrip():
     assert len(reconstructed.turns) == 1
     assert reconstructed.turns[0].sent == "test prompt"
     assert reconstructed.turns[0].tool_calls[0].name == "tool_a"
+    assert f.model_dump(mode="json")["success"] is True
     assert reconstructed.success is True
 
 

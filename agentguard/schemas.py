@@ -12,7 +12,7 @@ import uuid
 from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class ProbeOutcome(str, Enum):
@@ -72,6 +72,7 @@ class Finding(BaseModel):
     status: AttemptStatus = AttemptStatus.FAILED
     confidence: float = 0.0  # 0.0-1.0, set by judge.py when oracle == LLM_JUDGE; 1.0 for deterministic oracles
 
+    @computed_field
     @property
     def success(self) -> bool:
         """Backward-compat shim: existing code (reporters.py, cli.py) checks
