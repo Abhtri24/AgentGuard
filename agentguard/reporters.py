@@ -17,7 +17,7 @@ from agentguard._env import load_env
 from agentguard.config import get_config, normalize_model
 from agentguard.events import get_event_bus
 from agentguard.logging import get_logger
-from agentguard.schemas import Report, TraceEvent
+from agentguard.schemas import AttemptStatus, Finding, Report, TraceEvent
 
 load_env()
 logger = get_logger("reporters")
@@ -116,12 +116,14 @@ def _source_snippets(manifest: Manifest | None, max_chars: Optional[int] = None)
 def _mcp_servers(project_path: Optional[str | Path]) -> list[MCPServerStdio] | None:
     if not project_path:
         return None
+    repo_root = str(Path(__file__).resolve().parent.parent)
     return [MCPServerStdio(
         command=sys.executable,
         args=["-m", "agentguard.mcp_server"],
         env={
             "AGENTGUARD_TARGET_DIRECTORY": str(Path(project_path).resolve()),
             "AGENTGUARD_TRACE_PATH": "trace.jsonl",
+            "PYTHONPATH": repo_root,
         },
     )]
 
@@ -316,9 +318,65 @@ def generate_report(findings_path: str | Path, report_path: str | Path,
     if not resolved_proj_path and manifest_path:
         resolved_proj_path = Path(manifest_path).resolve().parent
 
+def _deterministic_report_fallback(
+    findings: dict[str, Any], scorecard: dict[str, Any], manifest: Manifest | None = None
+) -> Report:
+    confirmed = []
+    severity = {}
+    remediation = {}
+    for a in findings.get("attempts", []):
+        is_success = a.get("success") or a.get("status") in (
+            AttemptStatus.CONFIRMED.value, AttemptStatus.CONFIRMED,
+            AttemptStatus.SUSPECTED.value, AttemptStatus.SUSPECTED,
+        )
+        if is_success:
+            try:
+                finding = Finding.model_validate(a)
+                confirmed.append(finding)
+                fid = finding.id
+                cat = finding.category
+                if cat == "tool_misuse":
+                    severity[fid] = "critical"
+                    remediation[fid] = "Require explicit human confirmation before executing destructive tools (e.g., transfer_funds)."
+                elif cat in ("data_exfiltration", "privilege_escalation"):
+                    severity[fid] = "high"
+                    remediation[fid] = f"Validate user authority and restrict unauthorized operations for {cat.replace('_', ' ')}."
+                elif cat in ("prompt_injection", "secret_extraction"):
+                    severity[fid] = "high"
+                    remediation[fid] = "Enforce strong system prompt boundaries and prevent instructions leakage."
+                else:
+                    severity[fid] = "medium"
+                    remediation[fid] = "Review application logic and restrict unverified inputs."
+            except Exception:
+                pass
+    return Report(
+        scorecard=scorecard,
+        findings=confirmed,
+        severity=severity,
+        remediation=remediation,
+    )
+
+
+def generate_report(findings_path: str | Path, report_path: str | Path,
+                     manifest_path: str | Path | None = None,
+                     model: Optional[str] = None,
+                     project_path: Optional[str | Path] = None) -> str:
+    """Findings JSON (+ optional manifest for real source) in, report.md out.
+    No network access to any target."""
+    logger.info("Generating report from %s -> %s", findings_path, report_path)
+    findings = load_findings(findings_path)
+    scorecard = compute_scorecard(findings)
+    manifest = Manifest.from_yaml(manifest_path) if manifest_path else None
+    
+    # Infer project path if not explicitly provided
+    resolved_proj_path = project_path
+    if not resolved_proj_path and manifest_path:
+        resolved_proj_path = Path(manifest_path).resolve().parent
+
     crew = build_crew(findings, scorecard, manifest, model=model, project_path=resolved_proj_path)
 
     last_error: Exception | None = None
+    result = None
     for attempt in range(4):
         try:
             logger.info("Running CrewAI reporting tasks (attempt %d/4)...", attempt + 1)
@@ -328,14 +386,48 @@ def generate_report(findings_path: str | Path, report_path: str | Path,
             last_error = e
             if "rate_limit" not in str(e).lower() and "RateLimitError" not in type(e).__name__:
                 logger.error("CrewAI kickoff failed with non-rate-limit error: %s", e)
-                raise
+                break
             sleep_duration = 25 * (attempt + 1)
             logger.warning("CrewAI hit rate limit, waiting %ds before retry (%s)", sleep_duration, e)
             time.sleep(sleep_duration)
-    else:
-        raise last_error  # type: ignore[misc]
 
-    report = Report.model_validate(getattr(result, "pydantic", None) or result)
+    report: Report | None = None
+    if result is not None:
+        try:
+            report_data = getattr(result, "pydantic", None) or getattr(result, "raw", None) or result
+            if isinstance(report_data, Report):
+                report = report_data
+            elif isinstance(report_data, str):
+                try:
+                    parsed = json.loads(report_data)
+                    report = Report.model_validate(parsed)
+                except Exception:
+                    import re
+                    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", report_data, re.DOTALL)
+                    if m:
+                        report = Report.model_validate(json.loads(m.group(1)))
+                    else:
+                        raise
+            elif report_data is not None:
+                report = Report.model_validate(report_data)
+        except Exception as exc:
+            logger.warning("output_pydantic failed against provider (%s); running deterministic Report fallback", exc)
+            get_event_bus().emit(TraceEvent(
+                source="reporter",
+                event_type="error",
+                payload={"error": f"output_pydantic validation failed: {exc}", "detail": "running deterministic Report fallback"},
+            ))
+            report = None
+
+    if report is None:
+        if last_error is not None:
+            get_event_bus().emit(TraceEvent(
+                source="reporter",
+                event_type="error",
+                payload={"error": f"crew kickoff failed: {last_error}", "detail": "running deterministic Report fallback"},
+            ))
+        report = _deterministic_report_fallback(findings, scorecard, manifest)
+
     Path(report_path).with_suffix(".json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
     report_md = _report_markdown(report)
     Path(report_path).write_text(report_md, encoding="utf-8")

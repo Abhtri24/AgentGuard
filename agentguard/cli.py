@@ -107,22 +107,26 @@ def test(project_path: str, target_url: str, manifest_path: str | None,
     )
 
     click.echo(f"Attacking {target_url} ...")
-    sink = run_attack_suite_sync(
-        target,
-        manifest,
-        canaries=list(canaries),
-        max_probes=probes,
-        model=attacker_model,
-        budget=None,
-        profile=profile,
-    )
-    findings_data = {
-        "target": sink.target_desc,
-        "manifest_summary": sink.manifest_summary,
-        "attempts": sink.session_state["findings"],
-    }
-    Path(findings_out).write_text(json.dumps(findings_data, indent=2), encoding="utf-8")
-    click.echo(f"Wrote {findings_out}")
+    sink = None
+    try:
+        sink = run_attack_suite_sync(
+            target,
+            manifest,
+            canaries=list(canaries),
+            max_probes=probes,
+            model=attacker_model,
+            budget=None,
+            profile=profile,
+        )
+    finally:
+        if sink is not None:
+            findings_data = {
+                "target": sink.target_desc,
+                "manifest_summary": sink.manifest_summary,
+                "attempts": sink.session_state.get("findings", [a.model_dump(mode="json") for a in sink.attempts]),
+            }
+            Path(findings_out).write_text(json.dumps(findings_data, indent=2), encoding="utf-8")
+            click.echo(f"Wrote {findings_out}")
 
     if getattr(sink, "_budget", None) is not None:
         logger.info("Budget usage: %s", sink._budget.usage_report())

@@ -196,19 +196,28 @@ def _before_model_callback(callback_context: Any, llm_request: Any) -> None:
         _emit_callback_error("before_model")
 
 
-def _after_model_callback(callback_context: Any, llm_response: Any) -> None:
+def _after_model_callback(callback_context: Any, llm_response: Any) -> Any:
     try:
         # Some providers qualify a declared function as ``functions.name``.
         # ADK's tools dictionary contains the declared bare name.
         content = getattr(llm_response, "content", None)
         for part in getattr(content, "parts", []) or []:
             function_call = getattr(part, "function_call", None)
-            name = getattr(function_call, "name", None)
-            if name and "." in name:
-                function_call.name = name.rsplit(".", 1)[-1]
+            if isinstance(function_call, dict):
+                name = function_call.get("name")
+                if name and "." in name:
+                    function_call["name"] = name.rsplit(".", 1)[-1]
+            elif function_call is not None:
+                name = getattr(function_call, "name", None)
+                if name and "." in name:
+                    try:
+                        function_call.name = name.rsplit(".", 1)[-1]
+                    except Exception:
+                        pass
         _emit_callback_event("after_model", response=str(llm_response))
     except Exception:
         _emit_callback_error("after_model")
+    return llm_response
 
 
 def _before_tool_callback(tool: Any, args: dict[str, Any], tool_context: Any) -> None:
@@ -335,6 +344,10 @@ class FindingsSink:
         received: dict,
         outcome: ProbeOutcome = ProbeOutcome.INCONCLUSIVE,
     ) -> None:
+        resp_text = str(received.get("output") or received.get("response") or "")
+        if "[turn limit reached" in resp_text:
+            logger.debug("Ignoring synthetic turn-limit filler from turn evidence")
+            return
         raw_tool_calls = received.get("tool_calls", [])
         tool_records = [
             ToolCallRecord(
@@ -602,12 +615,15 @@ async def run_attack_suite(target: Target, manifest: Manifest,
             )
         except Exception as exc:  # keep one broken category from losing the whole run
             logger.exception("Attack category %s failed", category)
-            if not sink.attempts or sink.attempts[-1].id != sink._attempt_id:
+            attempt_id = getattr(sink, "_attempt_id", None) or f"{category}-{uuid.uuid4().hex[:6]}"
+            capability_targeted = getattr(sink, "_capability_targeted", None) or CAPABILITY_TARGETED.get(category, category)
+            turns = getattr(sink, "_turns", [])
+            if not sink.attempts or sink.attempts[-1].id != attempt_id:
                 sink.attempts.append(Finding(
-                    id=sink._attempt_id,
+                    id=attempt_id,
                     category=category,
-                    capability_targeted=sink._capability_targeted,
-                    turns=sink._turns,
+                    capability_targeted=capability_targeted,
+                    turns=turns,
                     status=AttemptStatus.ERROR,
                     confidence=0.0,
                     oracle_detail=f"attack runner error: {type(exc).__name__}: {exc}",
