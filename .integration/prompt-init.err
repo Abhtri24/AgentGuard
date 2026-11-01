@@ -1,0 +1,12 @@
+E:\agentSentry-main\.venv\Lib\site-packages\google\cloud\aiplatform\models.py:52: FutureWarning: Support for google-cloud-storage < 3.0.0 will be removed in a future version of google-cloud-aiplatform. Please upgrade to google-cloud-storage >= 3.0.0.
+  from google.cloud.aiplatform.utils import gcs_utils
+E:\agentSentry-main\.venv\Lib\site-packages\google\adk\memory\vertex_ai_rag_memory_service.py:27: UserWarning: The `vertexai.preview.rag` module is deprecated and will be removed in a future version. Please migrate to the `agentplatform` client. For example:
+
+    import agentplatform
+
+    client = agentplatform.Client(project="your-project", location="us-central1")
+    client.rag.create_corpus(...)
+
+  from vertexai.preview import rag
+2026-11-01 22:20:25 [INFO] agentguard.manifest: Synthesizing manifest for samples\prompt_leak (use_llm=False)
+2026-11-01 22:20:25 [INFO] agentguard.manifest: Saved manifest to .integration\prompt-manifest.yaml

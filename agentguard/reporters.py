@@ -8,18 +8,22 @@ no import of agentguard.target and must stay that way.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from agentguard._env import load_env
 from agentguard.config import get_config, normalize_model
+from agentguard.events import get_event_bus
 from agentguard.logging import get_logger
+from agentguard.schemas import Report, TraceEvent
 
 load_env()
 logger = get_logger("reporters")
 
 from crewai import Agent, Crew, Process, Task, LLM  # noqa: E402
+from crewai.mcp.config import MCPServerStdio  # noqa: E402
 
 from agentguard.manifest import Manifest  # noqa: E402
 import crewai.llms.cache as _crewai_cache_mod  # noqa: E402
@@ -62,6 +66,33 @@ def compute_scorecard(findings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _reporter_step_callback(step: Any) -> None:
+    get_event_bus().emit(TraceEvent(source="reporter", event_type="crew_step", payload={"step": str(step)}))
+
+
+def _reporter_task_callback(task: Any) -> None:
+    get_event_bus().emit(TraceEvent(source="reporter", event_type="crew_task", payload={"task": str(task)}))
+
+
+def _report_markdown(report: Report) -> str:
+    lines = ["# Security Assessment Report", "", "## Scorecard"]
+    lines.extend(
+        f"- **{key.replace('_', ' ').title()}:** {value}"
+        for key, value in report.scorecard.items()
+        if key != "by_category"
+    )
+    lines.extend(["", "## Findings"])
+    for finding in report.findings:
+        lines.extend([
+            f"### {finding.id}",
+            f"- **Category:** {finding.category}",
+            f"- **Status:** {finding.status.value}",
+            f"- **Severity:** {report.severity.get(finding.id, 'manual review')}",
+            f"- **Remediation:** {report.remediation.get(finding.id, 'manual review required')}",
+        ])
+    return "\n".join(lines) + "\n"
+
+
 def _source_snippets(manifest: Manifest | None, max_chars: Optional[int] = None) -> str:
     """Real source for each manifest-declared tool as fallback."""
     if manifest is None:
@@ -80,6 +111,19 @@ def _source_snippets(manifest: Manifest | None, max_chars: Optional[int] = None)
             continue
         chunks.append(f"### {tool.file}\n```python\n{src}\n```")
     return "\n\n".join(chunks) if chunks else "(no source files found for declared tools)"
+
+
+def _mcp_servers(project_path: Optional[str | Path]) -> list[MCPServerStdio] | None:
+    if not project_path:
+        return None
+    return [MCPServerStdio(
+        command=sys.executable,
+        args=["-m", "agentguard.mcp_server"],
+        env={
+            "AGENTGUARD_TARGET_DIRECTORY": str(Path(project_path).resolve()),
+            "AGENTGUARD_TRACE_PATH": "trace.jsonl",
+        },
+    )]
 
 
 def get_remediation_source_context(
@@ -107,7 +151,7 @@ def get_remediation_source_context(
 
     if target_dir and target_dir.exists():
         try:
-            from agentguard.manifest import build_index, retrieve_chunks
+            from agentguard.mcp_server import configure_target_directory, search_code
 
             # Collect search queries from confirmed findings and manifest
             search_terms: list[str] = []
@@ -126,20 +170,14 @@ def get_remediation_source_context(
                     search_terms.append(t.name)
 
             clean_terms = list(dict.fromkeys(t for t in search_terms if t))
-            logger.debug("Querying Chroma vector index for remediation terms: %s", clean_terms)
-
-            collection = build_index(target_dir, collection_name="agentguard-remediation")
-            chunks = retrieve_chunks(collection, clean_terms, n_results=2)
-
-            if chunks:
-                formatted = [
-                    f"### Context from {c['file']}\n```python\n{c['text']}\n```"
-                    for c in chunks
-                ]
-                logger.info("Retrieved %d relevant vector chunks for remediation engineer", len(formatted))
-                return "\n\n".join(formatted)
+            configure_target_directory(target_dir)
+            matches = [search_code(term, str(target_dir), 2) for term in clean_terms]
+            matches = [match for match in matches if match != "no matches"]
+            if matches:
+                return "\n".join(matches)
         except Exception as exc:
-            logger.warning("Chroma remediation retrieval failed (%s), falling back to static snippets", exc)
+            get_event_bus().emit(TraceEvent(source="reporter", event_type="mcp_error", payload={"error": str(exc)}))
+            logger.warning("MCP code search failed (%s), falling back to static snippets", exc)
 
     return _source_snippets(manifest)
 
@@ -151,6 +189,8 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
     chosen_model = normalize_model(model or get_config().reporter_model)
     logger.debug("Building CrewAI reporter crew using model: %s", chosen_model)
     llm = LLM(model=chosen_model)
+    mcps = _mcp_servers(project_path)
+    mcp_repo_path = str(Path(project_path).resolve()) if project_path else ""
 
     analyst = Agent(
         role="Security severity analyst",
@@ -163,6 +203,7 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
         ),
         llm=llm,
         verbose=False,
+        mcps=mcps,
     )
 
     engineer = Agent(
@@ -176,6 +217,7 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
         ),
         llm=llm,
         verbose=False,
+        mcps=mcps,
     )
 
     writer = Agent(
@@ -188,6 +230,7 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
         ),
         llm=llm,
         verbose=False,
+        mcps=mcps,
     )
 
     successful = [a for a in findings.get("attempts", []) if a.get("success")]
@@ -204,7 +247,7 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
             f"{json.dumps(manifest_summary)}\n\n"
             "For each finding id, assign a severity (critical/high/medium/low) "
             "and a one-sentence justification grounded in what the manifest "
-            "says the target can actually do. If there are no findings, say "
+            "says the target can actually do. Use owasp_lookup for each category. If there are no findings, say "
             "so plainly."
         ),
         expected_output="A severity rating with justification for each finding id, keyed by id.",
@@ -222,7 +265,7 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
             "Never write generic advice like 'improve validation' — if you "
             "can't name something specific because it's not in the source "
             "above, say 'requires manual review of <area>' instead of "
-            "guessing."
+            f"guessing. Use search_code with repo_path={mcp_repo_path!r} when more context is needed."
         ),
         expected_output="A specific, code-level fix for each finding id, keyed by id.",
         agent=engineer,
@@ -238,26 +281,22 @@ def build_crew(findings: dict[str, Any], scorecard: dict[str, Any],
             f"{json.dumps(successful, indent=2)}\n\n"
             f"Attempted-but-failed attacks (JSON): {json.dumps(failed, indent=2)}\n\n"
             "Severities and fixes come from the previous two tasks.\n\n"
-            "Structure the report as:\n"
-            "1. Scorecard section — the numbers given, verbatim.\n"
-            "2. One section per confirmed finding: a verbatim transcript "
-            "excerpt (quote each turn's 'sent' and 'received' fields "
-            "exactly, do not paraphrase), the oracle proof line "
-            "(oracle + oracle_detail), severity, and fix.\n"
-            "3. An appendix listing attempted-but-failed attacks by "
-            "category, with counts.\n"
-            "If there are zero confirmed findings, state that plainly in "
-            "section 2 instead of fabricating one."
+            "Return a JSON object with scorecard (the numbers given, verbatim), "
+            "findings (the confirmed findings supplied above), severity (finding "
+            "id to severity), and remediation (finding id to specific fix)."
         ),
-        expected_output="A complete markdown security report following the structure given.",
+        expected_output="A Report JSON object matching the requested schema.",
         agent=writer,
         context=[rate_task, fix_task],
+        output_pydantic=Report,
     )
 
     return Crew(
         agents=[analyst, engineer, writer],
         tasks=[rate_task, fix_task, write_task],
         process=Process.sequential,
+        step_callback=_reporter_step_callback,
+        task_callback=_reporter_task_callback,
     )
 
 
@@ -296,7 +335,9 @@ def generate_report(findings_path: str | Path, report_path: str | Path,
     else:
         raise last_error  # type: ignore[misc]
 
-    report_md = getattr(result, "raw", None) or str(result)
+    report = Report.model_validate(getattr(result, "pydantic", None) or result)
+    Path(report_path).with_suffix(".json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    report_md = _report_markdown(report)
     Path(report_path).write_text(report_md, encoding="utf-8")
     logger.info("Successfully wrote report to %s", report_path)
     return report_md

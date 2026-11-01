@@ -39,6 +39,7 @@ _RATE_LIMIT_PATTERNS = [
 _refusal_re = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
 _guardrail_re = re.compile("|".join(_GUARDRAIL_PATTERNS), re.IGNORECASE)
 _rate_limit_re = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
+_NORMALIZE_QUOTES = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "\u00a0": " "})
 
 
 def classify_response(
@@ -70,6 +71,8 @@ def classify_response(
 
     if not output or not output.strip():
         return ProbeOutcome.INCONCLUSIVE
+
+    output = output.translate(_NORMALIZE_QUOTES)
 
     if _rate_limit_re.search(output):
         return ProbeOutcome.TARGET_RATE_LIMITED

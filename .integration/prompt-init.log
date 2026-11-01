@@ -1,0 +1,5 @@
+Scanning samples\prompt_leak ...
+Wrote .integration\prompt-manifest.yaml
+  tools: [] (destructive: [])
+  rag: False  memory: False
+  attacker categories this manifest routes to: ['prompt_injection', 'secret_extraction']

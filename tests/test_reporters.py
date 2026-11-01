@@ -83,3 +83,12 @@ def execute_funds_transfer(recipient: str, amount: float):
     context = get_remediation_source_context(findings, manifest, project_path=proj_dir)
     assert "execute_funds_transfer" in context
     assert "target_tool.py" in context
+
+
+def test_remediation_source_context_falls_back_when_mcp_fails(tmp_path: Path, monkeypatch):
+    source = tmp_path / "tool.py"
+    source.write_text("def transfer_funds():\n    pass\n", encoding="utf-8")
+    manifest = Manifest(tools=[ToolInfo(name="transfer_funds", file=str(source), destructive=True)])
+    monkeypatch.setattr("agentguard.mcp_server.search_code", lambda *args: (_ for _ in ()).throw(RuntimeError("down")))
+    context = get_remediation_source_context([], manifest, project_path=tmp_path)
+    assert "transfer_funds" in context

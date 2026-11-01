@@ -90,6 +90,21 @@ class Finding(BaseModel):
         return getattr(self, item, default)
 
 
+class Report(BaseModel):
+    scorecard: dict[str, Any]
+    findings: list[Finding]
+    severity: dict[str, str]
+    remediation: dict[str, str]
+
+
+class TargetProfile(BaseModel):
+    tools: list[str]
+    has_rag: bool
+    has_memory: bool
+    purpose: Optional[str] = None
+    system_prompt_hint: Optional[str] = None
+
+
 class TraceEvent(BaseModel):
     """One row in the monitoring event stream. See events.py."""
     timestamp: float = Field(default_factory=time.time)

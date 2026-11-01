@@ -1,0 +1,14 @@
+INFO:     127.0.0.1:4840 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4849 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4856 - "POST /invoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4856 - "POST /invoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4861 - "POST /invoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4861 - "POST /invoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:4935 - "GET / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:4935 - "GET /favicon.ico HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:5531 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:5544 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:5643 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:5657 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:5657 - "POST /invoke HTTP/1.1" 200 OK
+INFO:     127.0.0.1:5657 - "POST /invoke HTTP/1.1" 200 OK

@@ -8,6 +8,10 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from agentguard.budget import BudgetTracker
 
+from agentguard._env import load_env
+
+load_env()
+
 import litellm
 from tenacity import (
     retry,
@@ -16,11 +20,9 @@ from tenacity import (
     wait_exponential,
 )
 
-from agentguard._env import load_env
 from agentguard.config import get_config, normalize_model
 from agentguard.logging import get_logger
 
-load_env()
 logger = get_logger("llm")
 
 # Suppress noisy LiteLLM startup/debugging logs

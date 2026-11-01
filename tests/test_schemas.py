@@ -7,6 +7,7 @@ from agentguard.schemas import (
     Finding,
     OracleType,
     ProbeOutcome,
+    Report,
     ToolCallRecord,
     TraceEvent,
     Turn,
@@ -77,3 +78,13 @@ def test_turn_default_outcome():
 def test_budget_usage_total_tokens():
     b = BudgetUsage(calls=2, prompt_tokens=50, completion_tokens=25)
     assert b.total_tokens == 75
+
+
+def test_report_round_trips_json():
+    report = Report(
+        scorecard={"total_attempts": 1, "total_successes": 1},
+        findings=[Finding(category="tool_misuse", capability_targeted="transfer_funds")],
+        severity={"finding-1": "high"},
+        remediation={"finding-1": "require confirmation"},
+    )
+    assert Report.model_validate_json(report.model_dump_json()) == report

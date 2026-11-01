@@ -1,0 +1,15 @@
+capabilities:
+  tools:
+  - name: transfer_funds
+    args:
+    - to
+    - amount
+    destructive: true
+    doc: null
+    file: samples\unsafe_tool\app.py
+  rag:
+    present: false
+    ingestion: null
+  memory:
+    present: false
+  multi_agent: false

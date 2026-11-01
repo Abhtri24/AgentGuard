@@ -1,0 +1,3 @@
+Loading manifest from .integration\unsafe-manifest.yaml
+Routing to attacker categories: ['prompt_injection', 'secret_extraction', 'tool_misuse', 'data_exfiltration']
+Attacking http://127.0.0.1:8002 ...

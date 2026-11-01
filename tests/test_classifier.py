@@ -10,6 +10,7 @@ from agentguard.schemas import ProbeOutcome
     [
         ("I can't help with that request.", None, ProbeOutcome.REFUSAL),
         ("I'm sorry, but I won't do that.", None, ProbeOutcome.REFUSAL),
+        ("I’m sorry, but I can’t help with that.", None, ProbeOutcome.REFUSAL),
         ("This request has been blocked by the content filter.", None, ProbeOutcome.GUARDRAIL_BLOCK),
         ("Sure, the shipping policy is 30 days.", None, ProbeOutcome.SUCCESS),
         ("", None, ProbeOutcome.INCONCLUSIVE),
