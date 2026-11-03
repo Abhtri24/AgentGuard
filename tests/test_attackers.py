@@ -1,14 +1,25 @@
 import base64
+import asyncio
+import inspect
 import json
 from pathlib import Path
+import pytest
 from agentguard.attackers import (
     CAPABILITY_TARGETED,
     PLAYBOOKS,
     FindingsSink,
     _assistant_message_no_reasoning,
+    _after_model_callback,
+    _after_tool_callback,
+    _before_model_callback,
+    _before_tool_callback,
+    _initial_state,
     _canary_oracle,
     _side_effect_oracle,
+    make_attacker,
 )
+from agentguard.events import get_event_bus, reset_event_bus
+from agentguard.schemas import AttemptStatus, ProbeOutcome, TargetProfile
 
 
 def test_canary_oracle():
@@ -100,6 +111,53 @@ def test_findings_sink_lifecycle(tmp_path: Path):
     assert saved["attempts"][0]["category"] == "prompt_injection"
 
 
+def test_findings_sink_scorecard_compatibility(tmp_path: Path):
+    from agentguard.reporters import compute_scorecard
+    from agentguard.schemas import AttemptStatus, Finding
+
+    sink = FindingsSink(
+        target_desc={"url": "http://127.0.0.1:8000"},
+        manifest_summary={"tools": []},
+    )
+    sink.attempts.append(
+        Finding(
+            category="prompt_injection",
+            capability_targeted="system_prompt",
+            status=AttemptStatus.CONFIRMED,
+        )
+    )
+    scorecard = compute_scorecard({"attempts": sink.attempts})
+    assert scorecard["total_successes"] == 1
+    assert scorecard["total_attempts"] == 1
+
+    # Real path: serialize to JSON and load back
+    out_file = tmp_path / "findings.json"
+    sink.to_json(out_file)
+    findings_data = json.loads(out_file.read_text(encoding="utf-8"))
+    json_scorecard = compute_scorecard(findings_data)
+    assert json_scorecard["total_successes"] == 1
+    assert json_scorecard["total_attempts"] == 1
+
+
+def test_finish_attempt_skips_judge_for_refusals(monkeypatch):
+    sink = FindingsSink({}, {})
+    sink.start_attempt("prompt_injection", "system_prompt")
+    sink.record_turn("ignore", {"output": "no", "tool_calls": []}, ProbeOutcome.REFUSAL)
+    monkeypatch.setattr("agentguard.judge.judge_attempt", lambda *args, **kwargs: pytest.fail("judge called"))
+    sink.finish_attempt()
+    assert sink.attempts[0].status == AttemptStatus.FAILED
+    assert sink.attempts[0].confidence == 0.9
+
+
+def test_finish_attempt_skips_judge_for_target_errors(monkeypatch):
+    sink = FindingsSink({}, {})
+    sink.start_attempt("prompt_injection", "system_prompt")
+    sink.record_turn("ignore", {"output": None, "tool_calls": []}, ProbeOutcome.TARGET_ERROR)
+    monkeypatch.setattr("agentguard.judge.judge_attempt", lambda *args, **kwargs: pytest.fail("judge called"))
+    sink.finish_attempt()
+    assert sink.attempts[0].status == AttemptStatus.ERROR
+
+
 def test_assistant_message_no_reasoning():
     msg = _assistant_message_no_reasoning(
         content="Hello",
@@ -112,3 +170,259 @@ def test_assistant_message_no_reasoning():
     assert msg["tool_calls"] == [{"id": "call_1"}]
     assert msg["extra_key"] == "keep_this_key"
     assert "reasoning_content" not in msg
+
+
+def test_attacker_callbacks_emit_events(monkeypatch):
+    captured = []
+    reset_event_bus()
+    get_event_bus().subscribe(captured.append)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=False, has_memory=False)
+    agent = make_attacker("tool_misuse", FakeTarget(), FindingsSink({}, {}), [], set(), 1, profile)
+    tool = type("Tool", (), {"name": "send_probe"})()
+    agent.kwargs["before_model_callback"](None, "request")
+    agent.kwargs["before_tool_callback"](tool, {"text": "probe"}, None)
+    agent.kwargs["after_tool_callback"](tool, {"text": "probe"}, None, {"response": "ok"})
+    agent.kwargs["after_model_callback"](None, "response")
+    assert [event.event_type for event in captured] == ["before_model", "before_tool", "after_tool", "after_model"]
+
+
+def test_adk_callback_parameter_names():
+    assert list(inspect.signature(_before_model_callback).parameters) == ["callback_context", "llm_request"]
+    assert list(inspect.signature(_after_model_callback).parameters) == ["callback_context", "llm_response"]
+    assert list(inspect.signature(_before_tool_callback).parameters) == ["tool", "args", "tool_context"]
+    assert list(inspect.signature(_after_tool_callback).parameters) == ["tool", "args", "tool_context", "tool_response"]
+
+
+def test_callback_failures_do_not_propagate(monkeypatch):
+    monkeypatch.setattr("agentguard.attackers._emit_callback_event", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError()))
+    assert _before_model_callback(None, None) is None
+    assert _after_model_callback(None, None) is None
+    assert _before_tool_callback(None, {}, None) is None
+    assert _after_tool_callback(None, {}, None, {}) is None
+
+
+def test_adk_model_callbacks_emit_events():
+    from google.adk.agents import LlmAgent
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.adk.runners import Runner
+    from google.adk.sessions import InMemorySessionService
+    from google.genai import types
+
+    class FakeLlm(BaseLlm):
+        async def generate_content_async(self, llm_request, stream=False):
+            yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text="done")]))
+
+    async def run():
+        reset_event_bus()
+        captured = []
+        get_event_bus().subscribe(captured.append)
+        service = InMemorySessionService()
+        agent = LlmAgent(name="fake", model=FakeLlm(model="fake"), before_model_callback=_before_model_callback, after_model_callback=_after_model_callback)
+        runner = Runner(agent=agent, app_name="test", session_service=service)
+        session = await service.create_session(app_name="test", user_id="user")
+        message = types.Content(role="user", parts=[types.Part(text="hello")])
+        async for _ in runner.run_async(user_id="user", session_id=session.id, new_message=message):
+            pass
+        return captured
+
+    events = asyncio.run(run())
+    assert {event.event_type for event in events} >= {"before_model", "after_model"}
+
+
+def test_initial_state_contains_profile():
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=True, has_memory=False)
+    assert _initial_state(profile) == {
+        "target_profile": profile.model_dump(),
+        "findings": [],
+    }
+
+
+def test_attacker_instruction_contains_target_profile(monkeypatch):
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=True, has_memory=False)
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    agent = make_attacker("tool_misuse", FakeTarget(), FindingsSink({}, {}), [], set(), 1, profile)
+    assert "transfer_funds" in agent.kwargs["instruction"]
+    assert "{target_profile}" in agent.kwargs["instruction"]
+
+
+def test_finish_attempt_appends_finding_to_state(monkeypatch):
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+        def invoke(self, text, session_id=None):
+            return {"output": "ok", "tool_calls": []}
+
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=True, has_memory=False)
+    captured = []
+    reset_event_bus()
+    get_event_bus().subscribe(captured.append)
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    sink = FindingsSink({}, {})
+    sink.start_attempt("tool_misuse", "destructive_tool")
+    sink.mark_success("side_effect", "transfer_funds fired")
+    agent = make_attacker("tool_misuse", FakeTarget(), sink, [], set(), 1, profile)
+    send = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "send_probe")
+    send("probe")
+    context = type("Context", (), {"state": _initial_state(profile)})()
+    finish = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "finish_attempt")
+    finish(context)
+
+    assert context.state["findings"] == [sink.attempts[0].model_dump(mode="json")]
+    assert captured[-1].event_type == "state_update"
+
+
+def test_session_state_finding_matches_sink(monkeypatch):
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+        def invoke(self, text, session_id=None):
+            return {"output": "ok", "tool_calls": []}
+
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=False, has_memory=False)
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    sink = FindingsSink({}, {})
+    sink.start_attempt("tool_misuse", "destructive_tool")
+    sink.mark_success("side_effect", "transfer_funds fired")
+    agent = make_attacker("tool_misuse", FakeTarget(), sink, [], set(), 1, profile)
+    send = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "send_probe")
+    send("probe")
+    state = _initial_state(profile)
+    finish = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "finish_attempt")
+    finish(type("Context", (), {"state": state})())
+    assert state["findings"] == [finding.model_dump(mode="json") for finding in sink.attempts]
+
+
+def test_record_finding_refuses_when_no_probe(monkeypatch):
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=False, has_memory=False)
+    sink = FindingsSink({}, {})
+    sink.start_attempt("tool_misuse", "destructive_tool")
+    agent = make_attacker("tool_misuse", FakeTarget(), sink, [], set(), 1, profile)
+    record = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "record_finding")
+    res = record("exploited", "high impact")
+    assert "rejected" in res
+    assert not sink._attacker_claimed_success
+
+
+def test_finish_attempt_refuses_when_no_probe(monkeypatch):
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeTarget:
+        def new_session_id(self):
+            return "session"
+
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+    profile = TargetProfile(tools=["transfer_funds"], has_rag=False, has_memory=False)
+    sink = FindingsSink({}, {})
+    sink.start_attempt("tool_misuse", "destructive_tool")
+    agent = make_attacker("tool_misuse", FakeTarget(), sink, [], set(), 1, profile)
+    finish = next(tool for tool in agent.kwargs["tools"] if tool.__name__ == "finish_attempt")
+    context = type("Context", (), {"state": _initial_state(profile)})()
+    res = finish(context)
+    assert "rejected" in res
+    assert len(sink.attempts) == 0
+
+
+def test_after_model_callback_strips_functions_prefix():
+    class FakeFunctionCall:
+        def __init__(self, name):
+            self.name = name
+
+    class FakePart:
+        def __init__(self, name):
+            self.function_call = FakeFunctionCall(name)
+
+    class FakeContent:
+        def __init__(self, name):
+            self.parts = [FakePart(name)]
+
+    class FakeResponse:
+        def __init__(self, name):
+            self.content = FakeContent(name)
+
+    resp = FakeResponse("functions.finish_attempt")
+    altered = _after_model_callback(None, resp)
+    assert altered.content.parts[0].function_call.name == "finish_attempt"
+
+    dict_part = type("Part", (), {"function_call": {"name": "functions.send_probe"}})()
+    resp_dict = type("Resp", (), {"content": type("Content", (), {"parts": [dict_part]})()})()
+    altered_dict = _after_model_callback(None, resp_dict)
+    assert altered_dict.content.parts[0].function_call["name"] == "send_probe"
+
+
+def test_turn_limit_filler_not_stored_as_evidence():
+    sink = FindingsSink({}, {})
+    sink.start_attempt("tool_misuse", "destructive_tool")
+    sink.record_turn("probe", {"output": "[turn limit reached — stop probing and call record_finding]"})
+    assert len(sink._turns) == 0
+
+
+@pytest.mark.asyncio
+async def test_category_exception_becomes_error_finding(monkeypatch):
+    from agentguard.attackers import run_attack_suite
+    from agentguard.manifest import Manifest, ToolInfo
+
+    class ExplodingTarget:
+        url = "http://fake"
+
+        def new_session_id(self):
+            return "session"
+
+        def invoke(self, text, session_id=None):
+            raise RuntimeError("Target crashed unexpectedly")
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("agentguard.attackers.LlmAgent", FakeAgent)
+
+    async def fake_run_attacker(*args, **kwargs):
+        raise RuntimeError("Runner crashed in category")
+
+    monkeypatch.setattr("agentguard.attackers.run_attacker", fake_run_attacker)
+
+    manifest = Manifest(tools=[ToolInfo(name="transfer_funds", destructive=True)])
+    sink = await run_attack_suite(ExplodingTarget(), manifest, max_probes=1)
+    assert len(sink.attempts) >= 1
+    assert any(a.status == AttemptStatus.ERROR for a in sink.attempts)
+    assert any("Runner crashed" in (a.oracle_detail or "") for a in sink.attempts)

@@ -6,9 +6,11 @@ import click
 
 from agentguard.attackers import run_attack_suite_sync
 from agentguard.config import AgentGuardConfig, get_config, set_config
+from agentguard.events import JSONLFileSink, get_event_bus
 from agentguard.logging import get_logger, setup_logging
 from agentguard.manifest import Manifest, synthesize
 from agentguard.reporters import compute_scorecard, generate_report
+from agentguard.schemas import TargetProfile
 from agentguard.target import Target
 
 logger = get_logger("cli")
@@ -73,6 +75,7 @@ def test(project_path: str, target_url: str, manifest_path: str | None,
     @expose/@watch from agentguard.adapter). This command never starts a
     target process itself.
     """
+    get_event_bus().subscribe(JSONLFileSink("trace.jsonl"))
     manifest_file = Path(manifest_path) if manifest_path else Path(project_path) / "manifest.yaml"
     if manifest_file.exists():
         click.echo(f"Loading manifest from {manifest_file}")
@@ -97,19 +100,37 @@ def test(project_path: str, target_url: str, manifest_path: str | None,
         )
 
     probes = max_probes if max_probes is not None else get_config().max_probes
+    profile = TargetProfile(
+        tools=[tool.name for tool in manifest.tools],
+        has_rag=bool(manifest.rag.get("present")),
+        has_memory=bool(manifest.memory.get("present")),
+    )
 
     click.echo(f"Attacking {target_url} ...")
-    sink = run_attack_suite_sync(
-        target,
-        manifest,
-        findings_out,
-        canaries=list(canaries),
-        max_probes=probes,
-        model=attacker_model,
-    )
-    click.echo(f"Wrote {findings_out}")
+    sink = None
+    try:
+        sink = run_attack_suite_sync(
+            target,
+            manifest,
+            canaries=list(canaries),
+            max_probes=probes,
+            model=attacker_model,
+            budget=None,
+            profile=profile,
+        )
+    finally:
+        if sink is not None:
+            findings_data = {
+                "target": sink.target_desc,
+                "manifest_summary": sink.manifest_summary,
+                "attempts": sink.session_state.get("findings", [a.model_dump(mode="json") for a in sink.attempts]),
+            }
+            Path(findings_out).write_text(json.dumps(findings_data, indent=2), encoding="utf-8")
+            click.echo(f"Wrote {findings_out}")
 
-    findings_data = json.loads(Path(findings_out).read_text(encoding="utf-8"))
+    if getattr(sink, "_budget", None) is not None:
+        logger.info("Budget usage: %s", sink._budget.usage_report())
+
     scorecard = compute_scorecard(findings_data)
     click.echo(f"Scorecard: {scorecard['total_successes']}/{scorecard['total_attempts']} "
                f"attacks succeeded ({scorecard['success_rate']:.0%})")

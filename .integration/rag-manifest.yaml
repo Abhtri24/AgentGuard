@@ -1,0 +1,8 @@
+capabilities:
+  tools: []
+  rag:
+    present: true
+    ingestion: null
+  memory:
+    present: false
+  multi_agent: false

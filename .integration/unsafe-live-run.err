@@ -1,0 +1,77 @@
+E:\agentSentry-main\.venv\Lib\site-packages\google\cloud\aiplatform\models.py:52: FutureWarning: Support for google-cloud-storage < 3.0.0 will be removed in a future version of google-cloud-aiplatform. Please upgrade to google-cloud-storage >= 3.0.0.
+  from google.cloud.aiplatform.utils import gcs_utils
+E:\agentSentry-main\.venv\Lib\site-packages\google\adk\memory\vertex_ai_rag_memory_service.py:27: UserWarning: The `vertexai.preview.rag` module is deprecated and will be removed in a future version. Please migrate to the `agentplatform` client. For example:
+
+    import agentplatform
+
+    client = agentplatform.Client(project="your-project", location="us-central1")
+    client.rag.create_corpus(...)
+
+  from vertexai.preview import rag
+2026-11-01 23:11:42 [INFO] agentguard.attackers: Running attack suite against http://127.0.0.1:8002 (categories: ['prompt_injection', 'secret_extraction', 'tool_misuse', 'data_exfiltration'])
+2026-11-01 23:11:42 [INFO] agentguard.attackers: Started attack attempt [prompt_injection-2c9cfb] category=prompt_injection
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "E:\agentSentry-main\.venv\Scripts\agentguard.exe\__main__.py", line 7, in <module>
+  File "E:\agentSentry-main\.venv\Lib\site-packages\click\core.py", line 1631, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\.venv\Lib\site-packages\click\core.py", line 1552, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\.venv\Lib\site-packages\click\core.py", line 2032, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\.venv\Lib\site-packages\click\core.py", line 1415, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\.venv\Lib\site-packages\click\core.py", line 910, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\agentguard\cli.py", line 110, in test
+    sink = run_attack_suite_sync(
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\agentguard\attackers.py", line 585, in run_attack_suite_sync
+    return asyncio.run(run_attack_suite(*args, **kwargs))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\asyncio\runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python312\Lib\asyncio\base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\agentguard\attackers.py", line 545, in run_attack_suite
+    await run_attacker(
+  File "E:\agentSentry-main\agentguard\attackers.py", line 486, in run_attacker
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\runners.py", line 314, in run_async
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\runners.py", line 310, in _run_with_trace
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\runners.py", line 354, in _exec_with_plugin
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\runners.py", line 304, in execute
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\agents\base_agent.py", line 248, in run_async
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\agents\base_agent.py", line 238, in _run_with_trace
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\agents\llm_agent.py", line 288, in _run_async_impl
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\flows\llm_flows\base_llm_flow.py", line 401, in run_async
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\flows\llm_flows\base_llm_flow.py", line 437, in _run_one_step_async
+    async for llm_response in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\flows\llm_flows\base_llm_flow.py", line 767, in _call_llm_async
+    async for event in agen:
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\flows\llm_flows\base_llm_flow.py", line 759, in _call_llm_with_tracing
+    if altered_llm_response := await self._handle_after_model_callback(
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\agentSentry-main\.venv\Lib\site-packages\google\adk\flows\llm_flows\base_llm_flow.py", line 840, in _handle_after_model_callback
+    callback_response = callback(
+                        ^^^^^^^^^
+TypeError: _after_model_callback() got an unexpected keyword argument 'callback_context'

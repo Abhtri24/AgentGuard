@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
 _loaded = False
 
 

@@ -83,3 +83,75 @@ def execute_funds_transfer(recipient: str, amount: float):
     context = get_remediation_source_context(findings, manifest, project_path=proj_dir)
     assert "execute_funds_transfer" in context
     assert "target_tool.py" in context
+
+
+def test_remediation_source_context_falls_back_when_mcp_fails(tmp_path: Path, monkeypatch):
+    source = tmp_path / "tool.py"
+    source.write_text("def transfer_funds():\n    pass\n", encoding="utf-8")
+    manifest = Manifest(tools=[ToolInfo(name="transfer_funds", file=str(source), destructive=True)])
+    monkeypatch.setattr("agentguard.mcp_server.search_code", lambda *args: (_ for _ in ()).throw(RuntimeError("down")))
+    context = get_remediation_source_context([], manifest, project_path=tmp_path)
+    assert "transfer_funds" in context
+
+
+def test_deterministic_report_fallback(tmp_path: Path):
+    from agentguard.reporters import _deterministic_report_fallback, _report_markdown
+    findings = {
+        "attempts": [
+            {
+                "id": "tool-misuse-123",
+                "category": "tool_misuse",
+                "capability_targeted": "transfer_funds",
+                "success": True,
+                "status": "confirmed",
+                "confidence": 1.0,
+                "turns": [],
+            }
+        ]
+    }
+    scorecard = {"total_attempts": 1, "total_successes": 1, "success_rate": 1.0}
+    report = _deterministic_report_fallback(findings, scorecard)
+    assert report.scorecard == scorecard
+    assert len(report.findings) == 1
+    assert report.severity["tool-misuse-123"] == "critical"
+    md = _report_markdown(report)
+    assert "# Security Assessment Report" in md
+    assert "Critical" in md or "critical" in md
+
+
+def test_generate_report_fallback_on_pydantic_failure(tmp_path: Path, monkeypatch):
+    import json
+    from agentguard.events import get_event_bus, reset_event_bus
+    from agentguard.reporters import generate_report
+
+    captured = []
+    reset_event_bus()
+    get_event_bus().subscribe(captured.append)
+
+    findings_file = tmp_path / "findings.json"
+    report_file = tmp_path / "report.md"
+    findings_file.write_text(json.dumps({
+        "attempts": [
+            {
+                "id": "tool_misuse-abc",
+                "category": "tool_misuse",
+                "capability_targeted": "transfer_funds",
+                "success": True,
+                "status": "confirmed",
+                "confidence": 1.0,
+                "turns": [],
+            }
+        ]
+    }), encoding="utf-8")
+
+    class BadCrew:
+        def kickoff(self):
+            # Returns an object without valid pydantic output
+            return type("Result", (), {"pydantic": None, "raw": "invalid json not matching schema"})()
+
+    monkeypatch.setattr("agentguard.reporters.build_crew", lambda *args, **kwargs: BadCrew())
+
+    out_md = generate_report(findings_file, report_file)
+    assert report_file.exists()
+    assert report_file.with_suffix(".json").exists()
+    assert any(e.event_type == "error" for e in captured)
